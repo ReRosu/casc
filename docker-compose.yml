@@ -1,0 +1,74 @@
+x-app: &app
+  build: .
+  environment: &app-env
+    DATABASE_URL: postgresql+asyncpg://casc:casc@postgres:5432/casc
+    REDIS_URL: redis://redis:6379/0
+    # Адрес для браузера и для колбэков (эмулятор подменяет localhost:18000 → api:8000).
+    PUBLIC_BASE_URL: http://localhost:18000
+    WEBHOOK_SECRET: compose-demo-webhook-secret
+    PAYMASTER_A__BASE_URL: http://emulator:8001/paymaster-a
+    PAYMASTER_A__TOKEN: pm-a-test-token
+    PAYMASTER_A__MERCHANT_ID: 11111111-1111-1111-1111-111111111111
+    PAYMASTER_B__BASE_URL: http://emulator:8001/paymaster-b
+    PAYMASTER_B__TOKEN: pm-b-test-token
+    PAYMASTER_B__MERCHANT_ID: 22222222-2222-2222-2222-222222222222
+    PALLY__BASE_URL: http://emulator:8001/pally
+    PALLY__TOKEN: "72|pally-test-token"
+    PALLY__SHOP_ID: LXZv3R7Q8B
+  depends_on:
+    postgres: {condition: service_healthy}
+    redis: {condition: service_healthy}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: casc
+      POSTGRES_PASSWORD: casc
+      POSTGRES_DB: casc
+    ports: ["55432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U casc"]
+      interval: 2s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports: ["56379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 20
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  api:
+    <<: *app
+    ports: ["18000:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      emulator: {condition: service_started}
+
+  worker:
+    <<: *app
+    command: ["taskiq", "worker", "app.worker.broker:broker", "--workers", "1"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+  scheduler:
+    <<: *app
+    command: ["taskiq", "scheduler", "app.worker.broker:scheduler"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+  emulator:
+    build: .
+    command: ["uvicorn", "app.emulator.app:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      EMULATOR_PUBLIC_URL: http://localhost:18001
+      EMULATOR_PALLY_RESULT_URL: http://api:8000/webhooks/pally
+      EMULATOR_REWRITE_HOSTS: localhost:18000=api:8000
+    ports: ["18001:8001"]
