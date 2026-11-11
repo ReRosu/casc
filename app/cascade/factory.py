@@ -6,6 +6,7 @@ from app.core.redis import get_redis
 from app.db.db import get_sessionmaker
 from app.providers.registry import get_registry
 from app.routing.circuit_breaker import RedisCircuitBreaker
+from app.routing.velocity import RedisVelocityLimiter
 from app.worker.queue import TaskiqQueue
 
 
@@ -22,5 +23,8 @@ def get_breaker() -> RedisCircuitBreaker:
 
 @lru_cache
 def get_cascade() -> CascadeEngine:
-    return CascadeEngine(get_sessionmaker(), get_registry(), get_breaker(), TaskiqQueue(),
-                         get_settings())
+    settings = get_settings()
+    limiter = RedisVelocityLimiter(get_redis(), limit=settings.card_velocity_limit,
+                                   window_seconds=settings.card_velocity_window_seconds)
+    return CascadeEngine(get_sessionmaker(), get_registry(), get_breaker(), limiter,
+                         TaskiqQueue(), settings)

@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import payments, providers, returns, webhooks
+from app.api import metrics, payments, providers, returns, webhooks
 from app.core.redis import close_redis
 from app.db.db import dispose_engine
 from app.providers.registry import close_registry
@@ -30,6 +30,7 @@ app.include_router(payments.router)
 app.include_router(returns.router)
 app.include_router(webhooks.router)
 app.include_router(providers.router)
+app.include_router(metrics.router)
 
 
 @app.get("/health", tags=["ops"])

@@ -33,7 +33,7 @@ poetry run taskiq scheduler app.worker.broker:scheduler &
 ## Тесты
 
 ```sh
-make test    # ruff + 129 тестов (unit + integration; integration нужен Postgres из compose)
+make test    # ruff + 140 тестов (unit + integration; integration нужны Postgres и Redis из compose)
 ```
 
 - `tests/unit` — классификация отказов, state machine, роутинг, circuit breaker, адаптеры
@@ -65,13 +65,14 @@ Idempotency-Key: 6f1c…
 
 | Метод | Путь | |
 |---|---|---|
-| `POST` | `/v1/payments` | Создать платёж: `flow=card` (карта) или `flow=link` (ссылка/реквизиты, `method=sbp\|bankcard`) |
+| `POST` | `/v1/payments` | Создать платёж: `flow=card` (карта) или `flow=link` (ссылка/реквизиты, `method=sbp\|bankcard`). `429` — превышен лимит платежей по карте |
 | `GET` | `/v1/payments/{id}` | Статус, попытки, `next_action` (3DS или переадресация) |
 | `POST` | `/v1/payments/{id}/refund` | Полный возврат |
 | `GET/POST` | `/v1/return/{attempt_id}` | Возврат браузера с hosted-страницы или 3DS (ACS) |
 | `POST` | `/webhooks/pally` | Postback Pally (подпись + сверка статуса через API) |
 | `POST` | `/webhooks/paymaster/{instance}/{attempt_id}/{hmac}` | Уведомление PayMaster (подпись в URL, статус сверяется через API) |
 | `GET` | `/v1/providers` | Маршруты и состояние circuit breaker |
+| `GET` | `/metrics` | Метрики Prometheus: approval rate по провайдерам, доля каскадов, UNKNOWN, дубли, очереди |
 | `POST` | `/v1/providers/{name}/circuit/reset` | Ручное закрытие breaker'а |
 
 ## Эмулятор и тестовые данные

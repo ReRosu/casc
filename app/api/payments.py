@@ -4,7 +4,14 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 
 from app.api.schemas import PaymentCreate, PaymentOut
-from app.cascade.engine import CascadeEngine, CreatePayment, IdempotencyConflict, InvalidState, NotFound
+from app.cascade.engine import (
+    CardVelocityExceeded,
+    CascadeEngine,
+    CreatePayment,
+    IdempotencyConflict,
+    InvalidState,
+    NotFound,
+)
 from app.cascade.factory import get_cascade
 
 router = APIRouter(prefix="/v1/payments", tags=["payments"])
@@ -33,6 +40,8 @@ async def create_payment(
     except IdempotencyConflict as exc:
         raise HTTPException(status.HTTP_409_CONFLICT,
                             "Idempotency-Key reused with a different request") from exc
+    except CardVelocityExceeded as exc:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
     if not created:
         response.status_code = status.HTTP_200_OK
     return PaymentOut.from_model(payment)

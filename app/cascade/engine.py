@@ -18,20 +18,19 @@ import hashlib
 import json
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import Enum, auto
 from typing import Protocol
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
-from app.core.security import callback_signature
-from app.db.models import Payment, PaymentAttempt
+from app.core.security import callback_signature, card_fingerprint
+from app.db.models import OutboxTask, Payment, PaymentAttempt
 from app.domain.enums import (
     AttemptStatus,
     DeclineClass,
@@ -47,6 +46,7 @@ from app.providers.base import ProviderAdapter, ProviderRequest, TransportFailur
 from app.providers.registry import ProviderRegistry
 from app.routing.circuit_breaker import CircuitBreaker
 from app.routing.router import RouteStep, build_route, load_rules
+from app.routing.velocity import VelocityLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,12 @@ class TaskQueue(Protocol):
 
 class IdempotencyConflict(Exception):
     pass
+
+
+class CardVelocityExceeded(Exception):
+    def __init__(self, limit: int) -> None:
+        super().__init__(f"more than {limit} payments with this card in the window")
+        self.limit = limit
 
 
 class NotFound(Exception):
@@ -108,15 +114,17 @@ class _AttemptCtx:
     request: ProviderRequest
 
 
-type _Task = Callable[[], Awaitable[None]]
+type _Task = tuple[str, uuid.UUID]  # (kind, attempt_id) — запись в outbox
 
 
 class CascadeEngine:
     def __init__(self, sessionmaker: async_sessionmaker[AsyncSession], registry: ProviderRegistry,
-                 breaker: CircuitBreaker, queue: TaskQueue, settings: Settings) -> None:
+                 breaker: CircuitBreaker, limiter: VelocityLimiter, queue: TaskQueue,
+                 settings: Settings) -> None:
         self._sm = sessionmaker
         self._registry = registry
         self._breaker = breaker
+        self._limiter = limiter
         self._queue = queue
         self._settings = settings
 
@@ -198,7 +206,9 @@ class CascadeEngine:
             assert payment is not None
             await s.refresh(attempt)  # перечитать уже под блокировкой платежа
             decision = self._apply(payment, attempt, result, latency_ms, tasks)
-        await self._dispatch(tasks)
+            outbox = [OutboxTask(kind=kind, attempt_id=aid) for kind, aid in tasks]
+            s.add_all(outbox)  # в той же транзакции, что и новое состояние
+        await self.relay_outbox(ids=[o.id for o in outbox])
         return decision
 
     async def apply_external(self, attempt_id: uuid.UUID, result: ProviderResult) -> None:
@@ -311,11 +321,17 @@ class CascadeEngine:
     async def _insert_payment(self, cmd: CreatePayment, request_hash: str) -> uuid.UUID | None:
         """Создать платёж с маршрутом. None — платёж с таким Idempotency-Key уже есть
         (в т.ч. если параллельный запрос вставил его на долю секунды раньше)."""
+        fingerprint = card_fingerprint(cmd.card.pan) if cmd.card else None
+        counted = False
         try:
             async with self._sm() as s, s.begin():
                 if await s.scalar(select(Payment.id).where(
                         Payment.idempotency_key == cmd.idempotency_key)):
                     return None
+                if fingerprint is not None:
+                    if not await self._limiter.hit(fingerprint):
+                        raise CardVelocityExceeded(self._settings.card_velocity_limit)
+                    counted = True
                 route = build_route(await load_rules(s), flow=cmd.flow, amount=cmd.amount,
                                     currency=cmd.currency, method=cmd.method)
                 payment = Payment(
@@ -331,6 +347,8 @@ class CascadeEngine:
                 await s.flush()
                 return payment.id
         except IntegrityError:
+            if counted and fingerprint is not None:
+                await self._limiter.release(fingerprint)
             return None
 
     async def _start_next_attempt(self, payment_id: uuid.UUID, *,
@@ -445,11 +463,11 @@ class CascadeEngine:
                 logger.warning("attempt %s: outcome unknown — no cascade until resolved",
                                attempt.id)
                 _set_status(payment, PaymentStatus.PROCESSING)
-                tasks.append(lambda: self._queue.poll_unknown(attempt.id))
+                tasks.append(("poll_unknown", attempt.id))
                 return Decision.STOP
 
             case AttemptStatus.UNKNOWN:  # stage LINK: денег нет, каскадим, счёт гасим в фоне
-                tasks.append(lambda: self._queue.cleanup_orphan(attempt.id))
+                tasks.append(("cleanup_orphan", attempt.id))
                 return self._continue(payment)
 
             case AttemptStatus.CANCELLED:  # ссылка, которую видел клиент, истекла
@@ -488,13 +506,13 @@ class CascadeEngine:
                 if other.id != attempt.id and other.mode is ProviderMode.HOSTED and other.status in (
                     AttemptStatus.REQUIRES_ACTION, AttemptStatus.UNKNOWN
                 ):
-                    tasks.append(lambda oid=other.id: self._queue.cleanup_orphan(oid))
+                    tasks.append(("cleanup_orphan", other.id))
         elif payment.succeeded_attempt_id != attempt.id:
             attempt.is_duplicate = True
             logger.error("ALERT double charge: payment %s already paid by %s, attempt %s also "
                          "succeeded — scheduling refund", payment.id,
                          payment.succeeded_attempt_id, attempt.id)
-            tasks.append(lambda: self._queue.refund_duplicate(attempt.id))
+            tasks.append(("refund_duplicate", attempt.id))
 
     async def _resolve_inline(self, adapter: ProviderAdapter, ctx: _AttemptCtx,
                               result: ProviderResult) -> ProviderResult:
@@ -568,13 +586,30 @@ class CascadeEngine:
         except Exception:  # недоступный Redis не должен ронять платёж
             logger.exception("circuit breaker update failed")
 
-    @staticmethod
-    async def _dispatch(tasks: list[_Task]) -> None:
-        for task in tasks:
+    async def relay_outbox(self, *, ids: list[uuid.UUID] | None = None,
+                           older_than: datetime | None = None, limit: int = 200) -> int:
+        """Отправить неотправленные задачи outbox в очередь. Вызывается сразу после commit
+        (ids) и из reconcile (older_than — то, что не отправилось). Доставка at-least-once:
+        задачи идемпотентны, повтор безопасен."""
+        stmt = select(OutboxTask).where(OutboxTask.sent_at.is_(None)).limit(limit)
+        if ids is not None:
+            stmt = stmt.where(OutboxTask.id.in_(ids))
+        if older_than is not None:
+            stmt = stmt.where(OutboxTask.created_at < older_than)
+        async with self._sm() as s:
+            rows = list((await s.scalars(stmt.order_by(OutboxTask.created_at))).all())
+        sent: list[uuid.UUID] = []
+        for row in rows:
             try:
-                await task()
-            except Exception:  # reconcile подберёт пропущенное
-                logger.exception("failed to enqueue background task")
+                await getattr(self._queue, row.kind)(row.attempt_id)
+                sent.append(row.id)
+            except Exception:  # останется неотправленной — reconcile повторит
+                logger.exception("failed to enqueue outbox task %s", row.id)
+        if sent:
+            async with self._sm() as s, s.begin():
+                await s.execute(update(OutboxTask).where(OutboxTask.id.in_(sent))
+                                .values(sent_at=datetime.now(UTC)))
+        return len(sent)
 
 
 def _set_status(payment: Payment, dst: PaymentStatus, failure_code: str | None = None) -> None:

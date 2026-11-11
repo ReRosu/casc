@@ -14,3 +14,10 @@ def callback_signature(provider: str, attempt_id: str) -> str:
 def verify_callback_signature(provider: str, attempt_id: str, signature: str) -> bool:
     return hmac.compare_digest(callback_signature(provider, attempt_id).encode(),
                                signature.encode())
+
+
+def card_fingerprint(pan: str) -> str:
+    """Стабильный отпечаток карты для лимитов. Нужен ключ (HMAC): пространство PAN мало,
+    и обычный хеш подбирается перебором."""
+    secret = get_settings().webhook_secret.get_secret_value().encode()
+    return hmac.new(secret, f"card:{pan}".encode(), hashlib.sha256).hexdigest()

@@ -6,6 +6,8 @@ x-app: &app
     # Адрес для браузера и для колбэков (эмулятор подменяет localhost:18000 → api:8000).
     PUBLIC_BASE_URL: http://localhost:18000
     WEBHOOK_SECRET: compose-demo-webhook-secret
+    # Демо гоняет одни и те же тестовые карты много раз — лимит по умолчанию (5/час) мешал бы.
+    CARD_VELOCITY_LIMIT: "1000"
     PAYMASTER_A__BASE_URL: http://emulator:8001/paymaster-a
     PAYMASTER_A__TOKEN: pm-a-test-token
     PAYMASTER_A__MERCHANT_ID: 11111111-1111-1111-1111-111111111111

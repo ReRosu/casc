@@ -40,6 +40,17 @@ class Settings(BaseSettings):
     # По умолчанию нет: отказ скорее всего от эмитента, лишние попытки бьют по репутации.
     cascade_after_hosted_decline: bool = False
 
+    # Лимит платежей по одной карте за окно: каскад не должен стать инструментом перебора
+    # карт, а лишние попытки (до max_attempts на платёж) бьют по репутации у эмитентов.
+    card_velocity_limit: int = 5
+    card_velocity_window_seconds: int = 3600
+
+    metrics_cache_seconds: int = 10
+
+    # Хранение: обработанные вебхуки и отправленные задачи outbox чистятся по расписанию.
+    webhook_retention_days: int = 30
+    outbox_retention_days: int = 7
+
     # HTTP к провайдерам
     provider_connect_timeout: float = 3.0
     provider_read_timeout: float = 5.0

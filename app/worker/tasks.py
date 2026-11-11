@@ -8,6 +8,7 @@ from taskiq import AsyncTaskiqDecoratedTask
 
 from app.cascade.factory import get_cascade
 from app.cascade.inbox import process_event
+from app.cascade.retention import purge_old_data
 from app.core.config import get_settings
 from app.core.redis import get_redis
 from app.db.db import get_sessionmaker
@@ -134,8 +135,14 @@ async def reconcile() -> None:
         *((resume_payment, p) for p in stalled),
         *((process_webhook, e) for e in webhooks),
     ]
-    kicked = 0
+    kicked = await get_cascade().relay_outbox(older_than=stale)  # задачи, не ушедшие в очередь
     for task, item_id in jobs:
         kicked += await _kick_once(task, item_id)
     if kicked:
         logger.info("reconcile: requeued %d items", kicked)
+
+
+@broker.task(schedule=[{"cron": "17 3 * * *"}])
+async def purge_old_data_task() -> None:
+    deleted = await purge_old_data(get_sessionmaker(), get_settings())
+    logger.info("retention: deleted %s", deleted)

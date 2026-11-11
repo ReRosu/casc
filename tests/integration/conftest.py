@@ -24,6 +24,7 @@ from app.domain.results import ProviderResult
 from app.providers.base import ProviderRequest, RefundResult
 from app.providers.registry import ProviderRegistry
 from app.routing.circuit_breaker import InMemoryCircuitBreaker
+from app.routing.velocity import InMemoryVelocityLimiter
 
 TEST_DB_URL = os.environ.get(
     "TEST_DATABASE_URL", "postgresql+asyncpg://casc:casc@localhost:55432/casc_test")
@@ -75,7 +76,7 @@ async def sm() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
 async def _clean(sm: async_sessionmaker[AsyncSession]) -> None:
     async with sm() as s, s.begin():
         await s.execute(text("update payments set succeeded_attempt_id = null"))
-        await s.execute(text("truncate payment_attempts, payments, webhook_inbox cascade"))
+        await s.execute(text("truncate payment_attempts, payments, webhook_inbox, outbox cascade"))
 
 
 @dataclass
@@ -170,7 +171,8 @@ def make_world(sm: async_sessionmaker[AsyncSession], **overrides: object) -> Wor
     queue = FakeQueue()
     breaker = InMemoryCircuitBreaker(threshold=3, open_seconds=30)
     registry = ProviderRegistry({"paymaster_a": a, "paymaster_b": b, "pally": pally})
-    engine = CascadeEngine(sm, registry, breaker, queue, settings)  # type: ignore[arg-type]
+    limiter = InMemoryVelocityLimiter(limit=settings.card_velocity_limit)
+    engine = CascadeEngine(sm, registry, breaker, limiter, queue, settings)  # type: ignore[arg-type]
     return World(engine, a, b, pally, queue, breaker, settings)
 
 
